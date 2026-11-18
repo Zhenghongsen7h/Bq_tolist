@@ -1,4 +1,5 @@
 import ctypes
+import calendar
 import os
 import sqlite3
 import tkinter as tk
@@ -48,6 +49,59 @@ def date_label(day):
     return f"{day.isoformat()}  周{WEEKDAYS[day.weekday()]}"
 
 
+class DeadlineTooltip:
+    """One compact, non-interactive hint shared by all task rows."""
+
+    def __init__(self, root):
+        self.root = root
+        self.job = self.window = self.widget = None
+        root.bind("<Configure>", lambda event: self.hide() if event.widget == root else None, add="+")
+        root.bind("<FocusOut>", lambda event: self.hide() if event.widget == root else None, add="+")
+
+    def attach(self, widget, read_deadline):
+        widget.bind("<Enter>", lambda event: self.schedule(widget, read_deadline), add="+")
+        for sequence in ("<Leave>", "<ButtonPress>", "<Unmap>", "<Destroy>"):
+            widget.bind(sequence, lambda event: self.hide(), add="+")
+
+    def schedule(self, widget, read_deadline):
+        self.hide()
+        if read_deadline():
+            self.widget = widget
+            self.job = self.root.after(350, lambda: self.show(widget, read_deadline))
+
+    def show(self, widget, read_deadline):
+        self.job = None
+        deadline = read_deadline()
+        if not deadline or not widget.winfo_exists() or not widget.winfo_viewable():
+            self.hide()
+            return
+        tip = self.window = tk.Toplevel(self.root)
+        tip.withdraw()
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=f"截止日期：{deadline}", font=("Microsoft YaHei UI", 9),
+                 bg="#FFFEF8", fg=INK, padx=8, pady=4,
+                 highlightthickness=1, highlightbackground="#B6BFCD").pack()
+        tip.update_idletasks()
+        width, height = tip.winfo_reqwidth(), tip.winfo_reqheight()
+        x = max(0, min(widget.winfo_rootx() + widget.winfo_width() - width,
+                       tip.winfo_screenwidth() - width))
+        y = widget.winfo_rooty() + widget.winfo_height() + 5
+        if y + height > tip.winfo_screenheight():
+            y = max(0, widget.winfo_rooty() - height - 5)
+        tip.geometry(f"+{x}+{y}")
+        tip.deiconify()
+
+    def hide(self):
+        if self.job is not None:
+            self.root.after_cancel(self.job)
+            self.job = None
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+        self.widget = None
+
+
 class TaskRow:
     """Keep native widgets alive; callbacks always read the current row data."""
 
@@ -77,6 +131,7 @@ class TaskRow:
                                 command=lambda key=key: self.invoke(key))
             button.pack(side="left", padx=(4, 0))
             self.buttons[key] = button
+        app.deadline_tooltip.attach(self.buttons["describe"], lambda: self.data[7] if self.data else "")
         self.label = tk.Label(self.frame, anchor="w", justify="left", bg="white")
         self.label.pack(side="left", fill="x", expand=True, padx=(3, 8))
         self.label.bind("<Double-Button-1>", lambda event: self.invoke("edit"))
@@ -90,10 +145,10 @@ class TaskRow:
         app.task_bind_scroll(self.frame)
 
     def invoke(self, action):
-        task_id, title, _, parent_id, number, description, priority = self.data
+        task_id, title, _, parent_id, number, description, priority, deadline = self.data
         args = {
             "toggle": (task_id, self.state), "reorder": (task_id, parent_id, number),
-            "describe": (task_id, number, description),
+            "describe": (task_id, number, description, deadline),
             "edit": (task_id, title, priority, parent_id),
             "add_subtask": (task_id,), "delete": (task_id, title),
         }
@@ -102,7 +157,7 @@ class TaskRow:
     def update(self, data):
         old = self.data
         self.data = data
-        _, title, done, parent_id, number, description, priority = data
+        _, title, done, parent_id, number, description, priority, deadline = data
         if old is None or old[1] != title:
             self.label.configure(text=title)
         if old is None or old[2] != done:
@@ -111,9 +166,9 @@ class TaskRow:
                                  fg=MUTED if done else INK)
         if old is None or old[4] != number:
             self.number.configure(text=number)
-        if old is None or bool(old[5]) != bool(description):
+        if old is None or bool(old[5] or old[7]) != bool(description or deadline):
             self.buttons["describe"].configure(
-                style="HasDescription.TaskAction.TButton" if description else "TaskAction.TButton")
+                style="HasDescription.TaskAction.TButton" if description or deadline else "TaskAction.TButton")
         if old is None or old[6] != priority:
             self.light.configure(image=self.app.priority_lights[priority, 12] if priority in PRIORITIES else "")
         if old is None or (old[3] is None) != (parent_id is None):
@@ -126,6 +181,7 @@ class TaskRow:
 class App:
     def __init__(self, root, store):
         self.root, self.store = root, store
+        self.deadline_tooltip = DeadlineTooltip(root)
         self.page = "tasks"
         self.day = date.today()
         self.week = monday(self.day)
@@ -193,7 +249,7 @@ class App:
                  bg=RAIL, fg="white").pack(pady=(0, 8), anchor="w")
         tk.Label(rail, text="让每一天，有条有理", bg=RAIL, fg="#9DAEC8",
                  font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(0, 32))
-        tk.Label(rail, text="v0.2.2", bg=RAIL, fg="#9DAEC8",
+        tk.Label(rail, text="v0.2.3", bg=RAIL, fg="#9DAEC8",
                  font=("Microsoft YaHei UI", 9)).pack(side="bottom", anchor="w")
         self.nav = {}
         for key, label in PAGES.items():
@@ -231,6 +287,7 @@ class App:
         self.status.set(message or "本地存储 · 自动保存已开启")
 
     def render(self):
+        self.deadline_tooltip.hide()
         if self.page == "tasks" and self.task_canvas is not None:
             self.refresh_tasks()
             return
@@ -271,10 +328,14 @@ class App:
         dialog.minsize(480, 320)
         body = tk.Frame(dialog, bg=BG, padx=26, pady=22)
         body.pack(fill="both", expand=True)
-        tk.Label(body, text=title, bg=BG, fg=INK,
+        heading = tk.Frame(body, name="heading", bg=BG)
+        heading.pack(fill="x", pady=(0, 18))
+        titles = tk.Frame(heading, bg=BG)
+        titles.pack(side="left", fill="x", expand=True)
+        tk.Label(titles, text=title, bg=BG, fg=INK,
                  font=("Microsoft YaHei UI", 19, "bold")).pack(anchor="w")
-        tk.Label(body, text=description, bg=BG, fg=MUTED,
-                 anchor="w").pack(fill="x", pady=(7, 18))
+        tk.Label(titles, text=description, bg=BG, fg=MUTED,
+                 anchor="w").pack(fill="x", pady=(7, 0))
         dialog.bind("<Escape>", lambda event: dialog.destroy())
         dialog.update_idletasks()
         width = min(width, dialog.winfo_screenwidth() - 40)
@@ -286,13 +347,103 @@ class App:
         dialog.geometry(f"{width}x{height}+{x}+{y}")
         return dialog, body
 
-    def edit_value(self, title, description, initial, *, multiline=False, allow_delete=False, priority=None):
+    def pick_deadline(self, parent, variable):
+        picker = tk.Toplevel(parent)
+        picker.title("选择截止日期")
+        picker.transient(parent)
+        picker.resizable(False, False)
+        picker.configure(bg=BG)
+        today = date.today()
+        month = today.replace(day=1)
+        header = tk.Frame(picker, bg=BG, padx=10, pady=10)
+        header.pack(fill="x")
+        caption = tk.StringVar(picker)
+        grid = tk.Frame(picker, bg=BG, padx=10, pady=5)
+        grid.pack()
+
+        def choose(value):
+            variable.set(value.isoformat())
+            picker.destroy()
+
+        def render():
+            caption.set(f"{month.year} 年 {month.month} 月")
+            previous.state(["disabled"] if month == date.min else ["!disabled"])
+            following.state(["disabled"] if month.year == 9999 and month.month == 12 else ["!disabled"])
+            for child in grid.winfo_children():
+                child.destroy()
+            for col, label in enumerate(WEEKDAYS):
+                tk.Label(grid, text=label, bg=BG, fg=MUTED).grid(row=0, column=col, pady=5)
+            for row, week in enumerate(calendar.monthcalendar(month.year, month.month), 1):
+                for col, number in enumerate(week):
+                    if number:
+                        value = date(month.year, month.month, number)
+                        ttk.Button(grid, text=str(number), width=3,
+                                   style="Accent.TButton" if value == today else "TButton",
+                                   command=lambda value=value: choose(value)).grid(row=row, column=col, padx=1, pady=1)
+
+        def change(offset):
+            nonlocal month
+            year, index = divmod(month.year * 12 + month.month - 1 + offset, 12)
+            month = date(year, index + 1, 1)
+            render()
+
+        previous = ttk.Button(header, text="‹", width=3, command=lambda: change(-1))
+        previous.pack(side="left")
+        following = ttk.Button(header, text="›", width=3, command=lambda: change(1))
+        following.pack(side="right")
+        tk.Label(header, textvariable=caption, bg=BG, fg=INK).pack(side="left", expand=True)
+        ttk.Button(picker, text="今天", command=lambda: choose(date.today())).pack(pady=10)
+        picker.bind("<Escape>", lambda event: picker.destroy())
+        render()
+        picker.update_idletasks()
+        x = max(0, min(parent.winfo_rootx() + 35, picker.winfo_screenwidth() - picker.winfo_reqwidth()))
+        y = max(0, min(parent.winfo_rooty() + 80, picker.winfo_screenheight() - picker.winfo_reqheight() - 60))
+        picker.geometry(f"+{x}+{y}")
+        picker.grab_set()
+        picker.focus_set()
+        parent.wait_window(picker)
+        if parent.winfo_exists():
+            parent.grab_set()
+
+    def edit_value(self, title, description, initial, *, multiline=False, allow_delete=False, priority=None, deadline=None):
         dialog, body = self.dialog_shell(title, description, height=440 if multiline else 320)
+        if deadline is not None:
+            dialog.minsize(640, 400)
         result = None
         actions = tk.Frame(body, bg=BG)
         actions.pack(side="bottom", fill="x", pady=(18, 0))
         error = tk.StringVar()
         tk.Label(body, textvariable=error, bg=BG, fg="#B33B40", anchor="w").pack(side="bottom", fill="x")
+        if deadline is not None:
+            due = tk.StringVar(dialog, value=deadline)
+            heading = body.nametowidget("heading")
+            due_group = tk.Frame(heading, bg=BG)
+            due_group.pack(side="right", anchor="n", padx=(16, 0), before=heading.winfo_children()[0])
+            tk.Label(due_group, text="截止日期", bg=BG, fg=INK,
+                     font=("Microsoft YaHei UI", 12)).pack(anchor="w", pady=(0, 6))
+            due_row = tk.Frame(due_group, bg=BG)
+            due_row.pack(anchor="w")
+            date_box = tk.Frame(due_row, bg="white", highlightthickness=1, highlightbackground="#B6BFCD")
+            date_box.pack(side="left")
+            style = ttk.Style(dialog)
+            style.configure("Deadline.TEntry", borderwidth=0, padding=(8, 5), fieldbackground="white")
+            due_field = ttk.Entry(date_box, textvariable=due, width=12,
+                                  style="Deadline.TEntry", font=("Microsoft YaHei UI", 12))
+            due_field.pack(side="left")
+            icon = tk.PhotoImage(master=dialog, width=24, height=24)
+            for rectangle in ((3, 6, 21, 8), (3, 11, 21, 13), (3, 21, 21, 23),
+                              (3, 6, 5, 23), (19, 6, 21, 23), (7, 2, 9, 10), (15, 2, 17, 10)):
+                icon.put(MUTED, to=rectangle)
+            style.configure("Calendar.TButton", padding=(3, 3), width=0, background="white",
+                            bordercolor="white", lightcolor="white", darkcolor="white")
+            calendar_button = ttk.Button(date_box, name="calendar_button", image=icon,
+                                          style="Calendar.TButton", cursor="hand2",
+                                          command=lambda: self.pick_deadline(dialog, due))
+            calendar_button.calendar_image = icon
+            calendar_button.pack(side="right", padx=(0, 4))
+            style.configure("DeadlineClear.TButton", padding=(6, 4), width=0, foreground=ACCENT,
+                            background=BG, bordercolor=BG, lightcolor=BG, darkcolor=BG)
+            ttk.Button(due_row, text="清除", style="DeadlineClear.TButton", command=lambda: due.set("")).pack(side="left", padx=(6, 0))
         if multiline:
             frame = tk.Frame(body, bg="white", highlightthickness=1, highlightbackground=EDGE)
             frame.pack(fill="both", expand=True)
@@ -329,11 +480,23 @@ class App:
         def submit(event=None):
             nonlocal result
             value = read()
-            if not value:
+            if deadline is not None:
+                due_value = due.get().strip()
+                try:
+                    if due_value:
+                        parsed = date.fromisoformat(due_value)
+                        if parsed.isoformat() != due_value:
+                            raise ValueError
+                except ValueError:
+                    error.set("截止日期无效，请选择日期或填写 YYYY-MM-DD。")
+                    due_field.focus_set()
+                    return "break"
+            if not value and deadline is None:
                 error.set("内容不能为空，请填写后再保存。")
                 field.focus_set()
                 return "break"
-            result = (value, selected.get()) if priority is not None else value
+            result = ((value, due_value) if deadline is not None else
+                      (value, selected.get()) if priority is not None else value)
             dialog.destroy()
             return "break"
 
@@ -344,7 +507,7 @@ class App:
             def delete_value():
                 nonlocal result
                 if messagebox.askyesno("删除进度", "删除这条进度？", parent=dialog):
-                    result = ""
+                    result = ("", deadline) if deadline is not None else ""
                     dialog.destroy()
 
             ttk.Button(actions, text="删除进度", command=delete_value).pack(side="left")
@@ -412,7 +575,10 @@ class App:
         if self.page == "tasks":
             self.task_canvas = canvas
         bar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=bar.set)
+        def scrolled(first, last):
+            self.deadline_tooltip.hide()
+            bar.set(first, last)
+        canvas.configure(yscrollcommand=scrolled)
         bar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         inner = tk.Frame(canvas, bg=BG)
@@ -433,6 +599,7 @@ class App:
         canvas.bind("<Configure>", resize_canvas)
 
         def scroll(event):
+            self.deadline_tooltip.hide()
             if canvas.yview() != (0.0, 1.0):
                 canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
             return "break"
@@ -521,6 +688,7 @@ class App:
 
         def refresh():
             nonlocal tasks, day, draft
+            self.deadline_tooltip.hide()
             changed_day = day != self.day.isoformat()
             if changed_day:
                 day = self.day.isoformat()
@@ -590,13 +758,13 @@ class App:
                 refresh()
                 self.status.set("已添加子待办")
 
-        def describe(task_id, number, description):
+        def describe(task_id, number, description, deadline):
             updated = self.edit_value("待办进度", f"事项 {number} · 支持多行文字",
-                                      description, multiline=True, allow_delete=True)
-            if updated is not None and updated != description:
-                self.store.set_description(task_id, updated)
+                                      description, multiline=True, allow_delete=True, deadline=deadline)
+            if updated is not None and updated != (description, deadline):
+                self.store.set_progress(task_id, *updated)
                 refresh()
-                self.status.set("已保存进度" if updated else "已删除进度")
+                self.status.set("已保存进度和截止日期")
 
         def reorder(task_id, parent_id, number):
             count = sum(row[3] == parent_id for row in tasks)
@@ -804,6 +972,7 @@ class App:
 
     def close(self):
         if self.flush():
+            self.deadline_tooltip.hide()
             self.store.db.close()
             self.root.destroy()
 

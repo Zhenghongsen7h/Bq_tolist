@@ -41,20 +41,22 @@ class Store:
                 self.db.execute("ALTER TABLE task ADD COLUMN description TEXT NOT NULL DEFAULT ''")
             if "priority" not in columns:
                 self.db.execute("ALTER TABLE task ADD COLUMN priority TEXT NOT NULL DEFAULT ''")
+            if "deadline" not in columns:
+                self.db.execute("ALTER TABLE task ADD COLUMN deadline TEXT NOT NULL DEFAULT ''")
         self.db.execute("PRAGMA foreign_keys = ON")
 
     def tasks(self, day):
         groups = {}
-        for task_id, title, done, parent_id, description, priority in self.db.execute("""
-            SELECT id, title, done, parent_id, description, priority FROM task
+        for task_id, title, done, parent_id, description, priority, deadline in self.db.execute("""
+            SELECT id, title, done, parent_id, description, priority, deadline FROM task
             WHERE day = ? ORDER BY COALESCE(position, id), id
         """, (day,)):
-            groups.setdefault(parent_id, []).append((task_id, title, done, description, priority))
+            groups.setdefault(parent_id, []).append((task_id, title, done, description, priority, deadline))
         rows = []
-        for index, (task_id, title, done, description, priority) in enumerate(groups.get(None, []), 1):
-            rows.append((task_id, title, done, None, str(index), description, priority))
-            for subindex, (child_id, child_title, child_done, child_description, child_priority) in enumerate(groups.get(task_id, []), 1):
-                rows.append((child_id, child_title, child_done, task_id, f"{index}.{subindex}", child_description, child_priority))
+        for index, (task_id, title, done, description, priority, deadline) in enumerate(groups.get(None, []), 1):
+            rows.append((task_id, title, done, None, str(index), description, priority, deadline))
+            for subindex, (child_id, child_title, child_done, child_description, child_priority, child_deadline) in enumerate(groups.get(task_id, []), 1):
+                rows.append((child_id, child_title, child_done, task_id, f"{index}.{subindex}", child_description, child_priority, child_deadline))
         return rows
 
     def add(self, day, title, parent_id=None):
@@ -95,7 +97,7 @@ class Store:
                 SELECT COALESCE(MAX(COALESCE(position, id)), 0) FROM task
                 WHERE day = ? AND parent_id IS NULL
             """, (target,)).fetchone()[0]
-            for task_id, title, done, parent_id, _, progress, priority in rows:
+            for task_id, title, done, parent_id, _, progress, priority, deadline in rows:
                 if parent_id is not None:
                     continue
                 subtasks = [row for row in rows if row[3] == task_id]
@@ -106,9 +108,9 @@ class Store:
                 # Keep completed children and their parent on the original day.
                 if any(row[2] for row in subtasks):
                     new_parent = self.db.execute("""
-                        INSERT INTO task(day, title, done, parent_id, position, description, priority)
-                        VALUES (?, ?, ?, NULL, ?, ?, ?)
-                    """, (target, title, done, position, progress, priority)).lastrowid
+                        INSERT INTO task(day, title, done, parent_id, position, description, priority, deadline)
+                        VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+                    """, (target, title, done, position, progress, priority, deadline)).lastrowid
                     self.db.execute("UPDATE task SET done = 1 WHERE id = ?", (task_id,))
                 else:
                     new_parent = task_id
@@ -128,6 +130,13 @@ class Store:
     def set_description(self, task_id, description):
         with self.db:
             self.db.execute("UPDATE task SET description = ? WHERE id = ?", (description, task_id))
+
+    def set_progress(self, task_id, description, deadline):
+        if deadline:
+            deadline = date.fromisoformat(deadline).isoformat()
+        with self.db:
+            self.db.execute("UPDATE task SET description = ?, deadline = ? WHERE id = ?",
+                            (description, deadline, task_id))
 
     def delete(self, task_id):
         with self.db:
@@ -163,7 +172,7 @@ class Store:
             if not tasks:
                 return "empty"
             lines = ["待办清单"]
-            for _, title, done, parent_id, number, progress, priority in tasks:
+            for _, title, done, parent_id, number, progress, priority, deadline in tasks:
                 indent = "  " if parent_id is not None else ""
                 status = "已完成" if done else "未完成"
                 title_line, *continuation = title.splitlines() or [title]
